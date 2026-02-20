@@ -1,0 +1,107 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.OUTPUTS_DATASET,
+  description: "Executive-ready daily KPI table with trend and stability indicators",
+  tags: ["executive", "kpi", "daily", dataform.projectConfig.vars.GA4_DATASET],
+  bigquery: {
+    partitionBy: "date",
+    labels: require("includes/core/helpers.js").helpers.storageLabels()
+  }
+}
+
+js {
+  const { helpers } = require("includes/core/helpers");
+}
+
+pre_operations {
+  SET @@query_label = "${helpers.executionLabels()}";
+}
+
+WITH sessions_daily AS (
+  SELECT
+    session_date AS date,
+    COUNT(DISTINCT session_id) AS sessions,
+    COUNT(DISTINCT IF(session_info.is_engaged_session, session_id, NULL)) AS engaged_sessions,
+    COUNT(DISTINCT COALESCE(uid, user_pseudo_id)) AS users
+  FROM ${ref("ga4_sessions")}
+  GROUP BY 1
+),
+
+transactions_daily AS (
+  SELECT
+    transaction_date AS date,
+    COUNTIF(NOT is_duplicate) AS purchases,
+    COUNT(DISTINCT IF(NOT is_duplicate, COALESCE(transaction_id, CAST(event_id AS STRING)), NULL)) AS transactions,
+    SUM(IF(NOT is_duplicate, COALESCE(ecommerce.purchase_revenue, 0), 0)) AS gross_revenue,
+    SUM(IF(NOT is_duplicate, ABS(COALESCE(refund_info.refund_item_totals.item_refund, 0)), 0)) AS refunded_amount,
+    SUM(IF(NOT is_duplicate, COALESCE(net_item_totals.item_revenue, 0), 0)) AS net_revenue
+  FROM ${ref("ga4_transactions")}
+  GROUP BY 1
+),
+
+daily_kpis AS (
+  SELECT
+    COALESCE(s.date, t.date) AS date,
+    COALESCE(s.sessions, 0) AS sessions,
+    COALESCE(s.engaged_sessions, 0) AS engaged_sessions,
+    COALESCE(s.users, 0) AS users,
+    COALESCE(t.purchases, 0) AS purchases,
+    COALESCE(t.gross_revenue, 0) AS gross_revenue,
+    COALESCE(t.refunded_amount, 0) AS refunded_amount,
+    COALESCE(t.net_revenue, 0) AS net_revenue,
+    COALESCE(t.transactions, 0) AS transactions,
+    SAFE_DIVIDE(COALESCE(t.net_revenue, 0), NULLIF(COALESCE(t.transactions, 0), 0)) AS aov,
+    SAFE_DIVIDE(COALESCE(t.transactions, 0), NULLIF(COALESCE(s.sessions, 0), 0)) AS cvr
+  FROM sessions_daily AS s
+  FULL OUTER JOIN transactions_daily AS t
+    USING (date)
+)
+
+SELECT
+  date,
+  sessions AS kpi_sessions,
+  engaged_sessions AS kpi_engaged_sessions,
+  users AS kpi_users,
+  purchases AS kpi_purchases,
+  gross_revenue AS kpi_gross_revenue,
+  refunded_amount AS kpi_refunded_amount,
+  net_revenue AS kpi_net_revenue,
+  transactions AS kpi_transactions,
+  aov AS kpi_average_order_value,
+  cvr AS kpi_conversion_rate,
+
+  SAFE_DIVIDE(
+    net_revenue - LAG(net_revenue, 7) OVER (ORDER BY date),
+    NULLIF(LAG(net_revenue, 7) OVER (ORDER BY date), 0)
+  ) AS kpi_net_revenue_wow_pct,
+  SAFE_DIVIDE(
+    net_revenue - LAG(net_revenue, 365) OVER (ORDER BY date),
+    NULLIF(LAG(net_revenue, 365) OVER (ORDER BY date), 0)
+  ) AS kpi_net_revenue_yoy_pct,
+  SAFE_DIVIDE(
+    cvr - LAG(cvr, 7) OVER (ORDER BY date),
+    NULLIF(LAG(cvr, 7) OVER (ORDER BY date), 0)
+  ) AS kpi_conversion_rate_wow_pct,
+  SAFE_DIVIDE(
+    cvr - LAG(cvr, 365) OVER (ORDER BY date),
+    NULLIF(LAG(cvr, 365) OVER (ORDER BY date), 0)
+  ) AS kpi_conversion_rate_yoy_pct,
+
+  AVG(net_revenue) OVER (
+    ORDER BY date
+    ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+  ) AS kpi_net_revenue_ma_7d,
+  AVG(net_revenue) OVER (
+    ORDER BY date
+    ROWS BETWEEN 27 PRECEDING AND CURRENT ROW
+  ) AS kpi_net_revenue_ma_28d,
+  AVG(cvr) OVER (
+    ORDER BY date
+    ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+  ) AS kpi_conversion_rate_ma_7d,
+  AVG(cvr) OVER (
+    ORDER BY date
+    ROWS BETWEEN 27 PRECEDING AND CURRENT ROW
+  ) AS kpi_conversion_rate_ma_28d
+FROM daily_kpis
+ORDER BY date
