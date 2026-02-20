@@ -1,0 +1,94 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.OUTPUTS_DATASET,
+  description: "Daily executive funnel summary with stage sessions, transition rates, losses, and WoW deltas",
+  tags: ["executive", "funnel", "daily", dataform.projectConfig.vars.GA4_DATASET],
+  bigquery: {
+    partitionBy: "date",
+    labels: require("includes/core/helpers.js").helpers.storageLabels()
+  }
+}
+
+js {
+  const { helpers } = require("includes/core/helpers");
+}
+
+pre_operations {
+  SET @@query_label = "${helpers.executionLabels()}";
+}
+
+WITH session_stage_flags AS (
+  SELECT
+    s.session_date AS date,
+    s.session_id,
+    COUNTIF(e.event_name = 'view_item') > 0 AS has_view_item,
+    COUNTIF(e.event_name = 'add_to_cart') > 0 AS has_add_to_cart,
+    COUNTIF(e.event_name = 'begin_checkout') > 0 AS has_begin_checkout,
+    COUNTIF(e.event_name = 'purchase') > 0 AS has_purchase
+  FROM ${ref("ga4_sessions")} AS s
+  LEFT JOIN ${ref("ga4_events")} AS e
+    ON s.session_id = e.session_id
+    AND e.event_name IN (
+      'view_item',
+      'add_to_cart',
+      'begin_checkout',
+      'purchase'
+    )
+  GROUP BY 1, 2
+),
+
+daily_funnel AS (
+  SELECT
+    date,
+    COUNT(DISTINCT IF(has_view_item, session_id, NULL)) AS view_item_sessions,
+    COUNT(DISTINCT IF(has_add_to_cart, session_id, NULL)) AS add_to_cart_sessions,
+    COUNT(DISTINCT IF(has_begin_checkout, session_id, NULL)) AS begin_checkout_sessions,
+    COUNT(DISTINCT IF(has_purchase, session_id, NULL)) AS purchase_sessions
+  FROM session_stage_flags
+  GROUP BY 1
+),
+
+funnel_with_rates AS (
+  SELECT
+    date,
+    view_item_sessions,
+    add_to_cart_sessions,
+    begin_checkout_sessions,
+    purchase_sessions,
+
+    SAFE_DIVIDE(add_to_cart_sessions, NULLIF(view_item_sessions, 0)) AS add_to_cart_rate,
+    SAFE_DIVIDE(begin_checkout_sessions, NULLIF(add_to_cart_sessions, 0)) AS checkout_rate,
+    SAFE_DIVIDE(purchase_sessions, NULLIF(begin_checkout_sessions, 0)) AS purchase_rate
+  FROM daily_funnel
+)
+
+SELECT
+  date,
+
+  view_item_sessions,
+  add_to_cart_sessions,
+  begin_checkout_sessions,
+  purchase_sessions,
+
+  add_to_cart_rate,
+  checkout_rate,
+  purchase_rate,
+
+  1 - add_to_cart_rate AS view_item_to_add_to_cart_loss_rate,
+  1 - checkout_rate AS add_to_cart_to_checkout_loss_rate,
+  1 - purchase_rate AS checkout_to_purchase_loss_rate,
+
+  SAFE_DIVIDE(
+    add_to_cart_rate - LAG(add_to_cart_rate, 7) OVER (ORDER BY date),
+    NULLIF(LAG(add_to_cart_rate, 7) OVER (ORDER BY date), 0)
+  ) AS add_to_cart_rate_wow_pct,
+  SAFE_DIVIDE(
+    checkout_rate - LAG(checkout_rate, 7) OVER (ORDER BY date),
+    NULLIF(LAG(checkout_rate, 7) OVER (ORDER BY date), 0)
+  ) AS checkout_rate_wow_pct,
+  SAFE_DIVIDE(
+    purchase_rate - LAG(purchase_rate, 7) OVER (ORDER BY date),
+    NULLIF(LAG(purchase_rate, 7) OVER (ORDER BY date), 0)
+  ) AS purchase_rate_wow_pct
+FROM funnel_with_rates
+ORDER BY date
