@@ -104,4 +104,3 @@ SELECT
     ROWS BETWEEN 27 PRECEDING AND CURRENT ROW
   ) AS kpi_conversion_rate_ma_28d
 FROM daily_kpis
-ORDER BY date
